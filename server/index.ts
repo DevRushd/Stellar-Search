@@ -23,12 +23,18 @@ import Groq from 'groq-sdk'
 import { paymentMiddlewareFromConfig } from '@x402/express'
 import { ExactStellarScheme } from '@x402/stellar/exact/server'
 import { HTTPFacilitatorClient } from '@x402/core/server'
+import type { RoutesConfig } from '@x402/core/server'
 import logger from './logger'
 import {
   STELLAR_NETWORK,
   AMOUNT_USDC,
-  AMOUNT_STROOPS
 } from '../src/lib/constants'
+import {
+  getNetwork,
+  buildExpressRoutes,
+  getPayTo,
+  getFacilitatorUrl,
+} from '../src/lib/x402Config'
 import { consumePaymentPayload } from '../src/lib/paymentIntegrity'
 import {
   normalizeOrganicResults,
@@ -98,13 +104,12 @@ const stats = {
 }
 
 // ─── Config ───────────────────────────────────────────────────────────────
-const RECEIVING_ADDRESS = process.env.STELLAR_RECEIVING_ADDRESS!
-const FACILITATOR_URL   = process.env.FACILITATOR_URL   || 'https://www.x402.org/facilitator'
-const NETWORK           = STELLAR_NETWORK as 'stellar:testnet' | 'stellar:mainnet'
+const NETWORK           = getNetwork() as 'stellar:testnet' | 'stellar:mainnet'
+const RECEIVING_ADDRESS = getPayTo()
+const FACILITATOR_URL   = getFacilitatorUrl()
 const SERPER_API_KEY    = process.env.SERPER_API_KEY!
 const GROQ_API_KEY      = process.env.GROQ_API_KEY!
 
-if (!RECEIVING_ADDRESS) console.warn('⚠  STELLAR_RECEIVING_ADDRESS not set')
 if (!SERPER_API_KEY)    console.warn('⚠  SERPER_API_KEY not set')
 if (!GROQ_API_KEY)      console.warn('⚠  GROQ_API_KEY not set')
 
@@ -113,29 +118,8 @@ const groq = new Groq({ apiKey: GROQ_API_KEY })
 
 // ─── x402 payment guard on /search ───────────────────────────────────────
 // paymentMiddlewareFromConfig is the recommended API per official Stellar docs.
-// It uses the Coinbase public facilitator (no API key needed for testnet).
-const x402Accepts = [{
-  scheme:  'exact',
-  price:   parseFloat(AMOUNT_USDC),
-  amount:  AMOUNT_STROOPS,
-  network: NETWORK,
-  payTo:   RECEIVING_ADDRESS,
-}]
-
-const x402Routes = {
-  'GET /search': {
-    accepts: x402Accepts,
-    description: `StellarSearch: pay-per-query web search — ${AMOUNT_USDC} USDC on Stellar`,
-  },
-  'GET /images': {
-    accepts: x402Accepts,
-    description: `StellarSearch: pay-per-query image search — ${AMOUNT_USDC} USDC on Stellar`,
-  },
-  'GET /news': {
-    accepts: x402Accepts,
-    description: `StellarSearch: pay-per-query news search — ${AMOUNT_USDC} USDC on Stellar`,
-  },
-}
+// Payment requirements come from the shared x402Config module (Issue #108).
+const x402Routes: RoutesConfig = buildExpressRoutes() as RoutesConfig
 
 const facilitatorClient = new HTTPFacilitatorClient({ url: FACILITATOR_URL })
 const schemes = [{ network: NETWORK, server: new ExactStellarScheme() }]

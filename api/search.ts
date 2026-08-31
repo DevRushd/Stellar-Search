@@ -1,17 +1,20 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
-import { 
-  STELLAR_NETWORK, 
-  USDC_CONTRACT, 
-  AMOUNT_STROOPS,
-  AMOUNT_USDC
+import {
+  STELLAR_NETWORK,
+  AMOUNT_USDC,
 } from '../src/lib/constants'
+import {
+  getNetwork,
+  buildPaymentRequiredPayload,
+  getPayTo,
+} from '../src/lib/x402Config'
 import { consumePaymentPayload } from '../src/lib/paymentIntegrity'
 import { normalizeOrganicResults } from '../src/lib/serperNormalizer'
 import type { SearchResponse, ApiErrorResponse } from '../src/types/index.js'
 
 // ─── Config ───────────────────────────────────────────────────────────────
-const RECEIVING_ADDRESS = process.env.STELLAR_RECEIVING_ADDRESS!
-const NETWORK           = STELLAR_NETWORK as 'stellar:testnet' | 'stellar:mainnet'
+const NETWORK           = getNetwork() as 'stellar:testnet' | 'stellar:mainnet'
+const RECEIVING_ADDRESS = getPayTo()
 const SERPER_API_KEY    = process.env.SERPER_API_KEY!
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -52,28 +55,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     req.headers['X-PAYMENT']
 
   if (!paymentHeader) {
-    // Return x402 v2 payment requirements
-    // The key fix: asset must be a Soroban C... contract address, NOT "USDC:ISSUER"
-    const paymentRequired = {
-      x402Version: 2,
-      error:       'Payment required',
-      resource: {
-        url:         `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers['host']}${req.url}`,
-        description: 'StellarSearch: pay-per-query web search — 0.001 USDC on Stellar',
-        mimeType:    'application/json',
-      },
-      accepts: [
-        {
-          scheme:            'exact',
-          network:           NETWORK,            // "stellar:testnet"
-          amount:            AMOUNT_STROOPS,     // "10000" (stroops, not dollars)
-          asset:             USDC_CONTRACT,      // "CBIELTK6..." (Soroban contract)
-          payTo:             RECEIVING_ADDRESS,  // your G... address
-          maxTimeoutSeconds: 300,
-          extra: { areFeesSponsored: true },
-        },
-      ],
-    }
+    // Return x402 v2 payment requirements from shared config (Issue #108)
+    const requestUrl = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers['host']}${req.url}`
+    const paymentRequired = buildPaymentRequiredPayload(requestUrl)
 
     res.setHeader(
       'PAYMENT-REQUIRED',
