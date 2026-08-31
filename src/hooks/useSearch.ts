@@ -83,7 +83,7 @@ export function useSearch(walletAddress: string | null = null) {
       }
 
     const advance = (step: PaymentStep) =>
-      setSession(prev => ({ ...prev, step }))
+      setSession((prev: SearchSession) => ({ ...prev, step }))
 
     try {
       if (!walletAddress) throw new Error('Connect your Freighter wallet first.')
@@ -238,7 +238,7 @@ export function useSearch(walletAddress: string | null = null) {
       console.error('❌ Search failed:', err)
       const msg = err.message || 'Search failed.'
       toast.error('Search Payment Failed', { description: msg })
-      setSession(prev => ({
+      setSession((prev: SearchSession) => ({
         ...prev,
         status: 'error',
         error:  msg,
