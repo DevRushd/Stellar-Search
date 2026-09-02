@@ -16,6 +16,59 @@ vi.mock('../src/lib/constants', async () => {
   }
 })
 
+// ─── Mock x402 facilitator ──────────────────────────────────────────────
+const { mockVerify, mockSettle, mockDecode } = vi.hoisted(() => ({
+  mockVerify: vi.fn().mockResolvedValue({ isValid: true }),
+  mockSettle: vi.fn().mockResolvedValue({ success: true, transaction: 'tx_ok', network: 'stellar:testnet' }),
+  mockDecode: vi.fn((header: string) => {
+    try {
+      const decoded = Buffer.from(header, 'base64').toString('utf8')
+      const parsed = JSON.parse(decoded)
+      return {
+        x402Version: 2,
+        payload: parsed,
+        accepted: {
+          scheme: 'exact',
+          network: 'stellar:testnet',
+          asset: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+          amount: '10000',
+          payTo: 'GAAZI4TCR3TY5OJHCTJC2A4AFL5MNSF3GAKGOWG5W2LBBGCS2TDPZOM3',
+          maxTimeoutSeconds: 300,
+          extra: { areFeesSponsored: true },
+        },
+      }
+    } catch {
+      throw new Error('Malformed payment payload')
+    }
+  }),
+}))
+
+vi.mock('@x402/core/server', () => ({
+  HTTPFacilitatorClient: class {
+    verify = mockVerify
+    settle = mockSettle
+    constructor(_opts: any) {}
+  },
+}))
+
+vi.mock('@x402/core/http', () => ({
+  decodePaymentSignatureHeader: mockDecode,
+}))
+
+vi.mock('@x402/stellar/exact/server', () => ({
+  ExactStellarScheme: class {},
+}))
+
+vi.mock('../src/lib/x402Config', async () => {
+  const actual: any = await vi.importActual('../src/lib/x402Config')
+  return {
+    ...actual,
+    getNetwork: () => 'stellar:testnet',
+    getPayTo: () => 'GAAZI4TCR3TY5OJHCTJC2A4AFL5MNSF3GAKGOWG5W2LBBGCS2TDPZOM3',
+    getFacilitatorUrl: () => 'https://www.x402.org/facilitator',
+  }
+})
+
 import handler from './search'
 import { resetConsumedPayments } from '../src/lib/paymentIntegrity'
 
@@ -47,7 +100,14 @@ describe('api/search — Vercel x402 settlement (aligned with Express)', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     resetConsumedPayments()
-    global.fetch = originalFetch
+    // Always use a spy so not.toHaveBeenCalled() assertions work
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ organic: [] }),
+    } as any)
+    // Default: facilitator verify and settle succeed
+    mockVerify.mockResolvedValue({ isValid: true })
+    mockSettle.mockResolvedValue({ success: true, transaction: 'tx_ok', network: 'stellar:testnet' })
   })
 
   it('handles OPTIONS preflight', async () => {
@@ -93,7 +153,7 @@ describe('api/search — Vercel x402 settlement (aligned with Express)', () => {
     expect(decoded.x402Version).toBe(2)
     expect(decoded.accepts[0].scheme).toBe('exact')
     expect(decoded.accepts[0].network).toBe('stellar:testnet')
-    expect(decoded.accepts[0].amount).toBe('10000') // stroops = 0.001 USDC
+    expect(decoded.accepts[0].amount).toBe('10000')
     expect(decoded.accepts[0].asset).toBe('CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA')
     expect(decoded.accepts[0].payTo).toBe(process.env.STELLAR_RECEIVING_ADDRESS)
     expect(decoded.accepts[0].maxTimeoutSeconds).toBe(300)
@@ -107,7 +167,7 @@ describe('api/search — Vercel x402 settlement (aligned with Express)', () => {
     expect(res.setHeader).toHaveBeenCalledWith('Access-Control-Expose-Headers', expect.stringContaining('PAYMENT-REQUIRED'))
   })
 
-  it('proceeds to search when payment header present (Serper mock)', async () => {
+  it('proceeds to search after facilitator verify+settle succeeds', async () => {
     const fakeTx = Buffer.from(JSON.stringify({ transactionHash: 'abc123' })).toString('base64')
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
@@ -124,6 +184,8 @@ describe('api/search — Vercel x402 settlement (aligned with Express)', () => {
       headers: { 'x-payment': fakeTx },
     })
     await handler(req, res)
+    expect(mockVerify).toHaveBeenCalledTimes(1)
+    expect(mockSettle).toHaveBeenCalledTimes(1)
     expect(res._json.results).toHaveLength(1)
     expect(res._json.results[0].title).toBe('Stellar')
     expect(res._json.paidAmount).toBe('0.001')
@@ -134,7 +196,6 @@ describe('api/search — Vercel x402 settlement (aligned with Express)', () => {
   })
 
   it('preserves x402 settlement — amount decoded from constants is 0.001 USDC', async () => {
-    // Verify that Vercel and Express share same amount via constants
     const { STELLAR_NETWORK, AMOUNT_STROOPS, AMOUNT_USDC } = await import('../src/lib/constants')
     expect(STELLAR_NETWORK).toBe('stellar:testnet')
     expect(parseInt(AMOUNT_STROOPS)).toBe(10000)
@@ -233,4 +294,84 @@ describe('api/search — Vercel x402 settlement (aligned with Express)', () => {
     expect(successes).toHaveLength(1)
     expect(rejections).toHaveLength(numConcurrent - 1)
   })
+
+  it('safely normalizes malformed Serper payloads by filtering out rows with invalid links', async () => {
+    const fakeTx = Buffer.from(JSON.stringify({ transactionHash: 'tx_malformed_vercel' })).toString('base64')
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        organic: [
+          { title: 'Bad Link', link: 'not-a-valid-http-url' },
+          { title: 'Valid Vercel Result', link: 'https://vercel.com/docs' },
+        ],
+      }),
+    } as any)
+
+    const { req, res } = mockReqRes({
+      method: 'GET',
+      query: { q: 'vercel' },
+      headers: { 'x-payment': fakeTx },
+    })
+
+    await handler(req, res)
+    expect(res._json.results).toHaveLength(1)
+    expect(res._json.results[0].title).toBe('Valid Vercel Result')
+    expect(res._json.results[0].url).toBe('https://vercel.com/docs')
+  })
+
+  it('distinguishes original, executed, and suggested query text when spelling is corrected', async () => {
+    const fakeTx = Buffer.from(JSON.stringify({ transactionHash: 'tx_spelling_test' })).toString('base64')
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        searchParameters: { q: 'stellar blockchain' },
+        searchInformation: { originalQuery: 'stelarr blockchan' },
+        organic: [
+          { title: 'Stellar', link: 'https://stellar.org', snippet: 'Blockchain' },
+        ],
+      }),
+    } as any)
+
+    const { req, res } = mockReqRes({
+      method: 'GET',
+      query: { q: 'stelarr blockchan' },
+      headers: { 'x-payment': fakeTx },
+    })
+
+    await handler(req, res)
+    expect(res._json.originalQuery).toBe('stelarr blockchan')
+    expect(res._json.executedQuery).toBe('stellar blockchain')
+    expect(res._json.suggestedQuery).toBe('stellar blockchain')
+    expect(res._json.isCorrected).toBe(true)
+    expect(res._json.query).toBe('stellar blockchain')
+  })
+
+  it('provides suggestedQuery when didYouMean is present without auto-correction', async () => {
+    const fakeTx = Buffer.from(JSON.stringify({ transactionHash: 'tx_did_you_mean_test' })).toString('base64')
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        searchParameters: { q: 'stelarr blockchan' },
+        spelling: { didYouMean: 'stellar blockchain' },
+        organic: [
+          { title: 'Stelarr Results', link: 'https://stellar.org/alt', snippet: 'Alt snippet' },
+        ],
+      }),
+    } as any)
+
+    const { req, res } = mockReqRes({
+      method: 'GET',
+      query: { q: 'stelarr blockchan' },
+      headers: { 'x-payment': fakeTx },
+    })
+
+    await handler(req, res)
+    expect(res._json.originalQuery).toBe('stelarr blockchan')
+    expect(res._json.executedQuery).toBe('stelarr blockchan')
+    expect(res._json.suggestedQuery).toBe('stellar blockchain')
+    expect(res._json.isCorrected).toBe(false)
+    expect(res._json.query).toBe('stelarr blockchan')
+  })
 })
+
+

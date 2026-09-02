@@ -1,17 +1,31 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { 
-  STELLAR_NETWORK, 
-  USDC_CONTRACT, 
-  AMOUNT_STROOPS,
-  AMOUNT_USDC
+  USDC_CONTRACT_MAINNET,
+  USDC_CONTRACT_TESTNET,
 } from '../src/lib/constants'
+import {
+  getNetwork,
+  buildPaymentRequirement,
+  getPayTo,
+  buildPaymentRequiredPayload,
+} from '../src/lib/x402Config'
 import { consumePaymentPayload } from '../src/lib/paymentIntegrity'
-import type { SearchResponse, ApiErrorResponse, SearchResult } from '../src/types/index.js'
+import { formatConfigurationError, readServerConfig } from '../src/lib/config'
 
 // ─── Config ───────────────────────────────────────────────────────────────
-const RECEIVING_ADDRESS = process.env.STELLAR_RECEIVING_ADDRESS!
-const NETWORK           = STELLAR_NETWORK as 'stellar:testnet' | 'stellar:mainnet'
-const SERPER_API_KEY    = process.env.SERPER_API_KEY!
+let config
+try {
+  config = readServerConfig()
+} catch (error) {
+  console.error(formatConfigurationError(error))
+  throw error
+}
+const RECEIVING_ADDRESS = config.receivingAddress
+const NETWORK           = config.stellarNetwork
+const SERPER_API_KEY    = config.serperApiKey
+const AMOUNT_STROOPS    = config.amountStroops
+const AMOUNT_USDC       = config.amountUsdc
+const USDC_CONTRACT     = NETWORK === 'stellar:mainnet' ? USDC_CONTRACT_MAINNET : USDC_CONTRACT_TESTNET
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
 
@@ -50,29 +64,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     req.headers['x-payment']         ||
     req.headers['X-PAYMENT']
 
-  if (!paymentHeader) {
-    // Return x402 v2 payment requirements
-    // The key fix: asset must be a Soroban C... contract address, NOT "USDC:ISSUER"
-    const paymentRequired = {
-      x402Version: 2,
-      error:       'Payment required',
-      resource: {
-        url:         `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers['host']}${req.url}`,
-        description: 'StellarSearch: pay-per-query web search — 0.001 USDC on Stellar',
-        mimeType:    'application/json',
-      },
-      accepts: [
-        {
-          scheme:            'exact',
-          network:           NETWORK,            // "stellar:testnet"
-          amount:            AMOUNT_STROOPS,     // "10000" (stroops, not dollars)
-          asset:             USDC_CONTRACT,      // "CBIELTK6..." (Soroban contract)
-          payTo:             RECEIVING_ADDRESS,  // your G... address
-          maxTimeoutSeconds: 300,
-          extra: { areFeesSponsored: true },
-        },
-      ],
-    }
+  if (!paymentHeader || typeof paymentHeader !== 'string') {
+    // Return x402 v2 payment requirements from shared config
+    const requestUrl = `${req.headers['x-forwarded-proto'] || 'http'}://${req.headers['host']}${req.url}`
+    const paymentRequired = buildPaymentRequiredPayload(requestUrl)
 
     res.setHeader(
       'PAYMENT-REQUIRED',
@@ -89,17 +84,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(402).json(errorBody)
   }
 
-  // ─── Payment present — proceed with search ────────────────────────────────
-  console.log('✅ Payment header received')
-
-  let txHash: string | null = null
-  try {
-    const decoded = Buffer.from(paymentHeader as string, 'base64').toString('utf8')
-    const parsed  = JSON.parse(decoded)
-    txHash = parsed.transactionHash || parsed.txHash || null
-  } catch {
-    // payment header not base64 JSON — fine, tx hash just won't show
+  // ─── Verify and settle payment via facilitator ───────────────────────────
+  const verification = await verifyPayment(paymentHeader)
+  if (!verification.ok) {
+    const errorBody: ApiErrorResponse = { error: verification.error }
+    return res.status(verification.status).json(errorBody)
   }
+
+  const txHash = verification.txHash
+
+  console.log('✅ Payment verified and settled via facilitator')
 
   const t0 = Date.now()
 
@@ -135,29 +129,23 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return res.status(502).json(errorBody)
     }
 
-    const data      = await serperRes.json() as Record<string, any>
-    const latencyMs = Date.now() - t0
+    const data: unknown = await serperRes.json()
+    const latencyMs    = Date.now() - t0
 
-    const results: SearchResult[] = (data.organic || []).map((r: any, i: number) => ({
-      id:             String(i + 1),
-      title:          r.title   || 'No title',
-      url:            r.link,
-      description:    r.snippet || '',
-      source:         (() => {
-        try { return new URL(r.link).hostname.replace('www.', '') }
-        catch { return r.link }
-      })(),
-      relevanceScore: Math.max(0.5, 1 - i * 0.06),
-      publishedAt:    r.date || undefined,
-    }))
+    const results = normalizeOrganicResults(data)
+    const queryMeta = normalizeQueryMetadata(data, q.trim())
 
     const responseBody: SearchResponse = {
-      query:      q.trim(),
+      query:          queryMeta.executedQuery,
+      originalQuery:  queryMeta.originalQuery,
+      executedQuery:  queryMeta.executedQuery,
+      suggestedQuery: queryMeta.suggestedQuery,
+      isCorrected:    queryMeta.isCorrected,
       results,
-      count:      results.length,
-      network:    NETWORK,
-      paidAmount: AMOUNT_USDC,
-      currency:   'USDC',
+      count:          results.length,
+      network:        NETWORK,
+      paidAmount:     AMOUNT_USDC,
+      currency:       'USDC',
       txHash,
       latencyMs,
     }
